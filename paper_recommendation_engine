@@ -1,7 +1,28 @@
 '''
-This code is used to calculate and use a paper recommendation model
-for each user of www.benty-fields.com. The current implementation uses 
-a Random forest model making use of the python sklearn package.
+Copyright 2017, Florian Beutler
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+###########################################################################
+
+This code is used to make paper recommendations for users on www.benty-fields.com.
+It has two use cases:
+
+(1) It is used to order the daily new publications for each user according to the user's interest
+(2) It is used to provide paper recommendations for each user
+
+If you have suggestions for improvements please contact benty-fields@feedback.com.
 '''
 
 from app import models, db, app, es
@@ -22,7 +43,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import precision_recall_curve
 from sklearn.metrics import roc_curve, auc
 from sklearn.metrics import average_precision_score
-from sklearn.cross_validation import KFold
+from sklearn.model_selection import KFold
 
 import nltk
 from nltk.stem.porter import PorterStemmer
@@ -46,7 +67,7 @@ def test():
         plot_y2 = []
         error_y2 = []
         for i, user in enumerate(users):
-            results = get_model_metrics_through_cross_validation(user[0])
+            results = get_auc_through_cross_validation(user[0])
 
             plot_x.append(user[1])
             plot_y.append(np.mean(results['aucs']))
@@ -55,6 +76,9 @@ def test():
             error_y2.append(np.std(results['pr']))
 
             plt.clf()
+            #y_av = moving_average(plot_y, 5)
+            #plt.plot(plot_x, y_av, "r")
+        
             plt.title('AUC as a function of click data objects')
             plt.errorbar(plot_x, plot_y, xerr=0., yerr=error_y, linewidth=1)
             plt.ylabel('AUC')
@@ -62,6 +86,9 @@ def test():
             plt.savefig(app.config['STATISTICS_FOLDER'] + "/AUC_vs_data.png", bbox_inches='tight')
 
             plt.clf()
+            #y_av = moving_average(plot_y2, 5)
+            #plt.plot(plot_x, y_av, "r")
+
             plt.title('Precision as a function of click data objects')
             plt.errorbar(plot_x, plot_y2, xerr=0., yerr=error_y2, linewidth=1)
             plt.ylabel('Precision')
@@ -72,7 +99,7 @@ def test():
 
 def get_tf_idf_ranking(papers, user):
     ''' This function is used to rank papers by user interest when the user selects a date on daily papers '''
-    X1, X2, X3 = prepare_data_for_prediction(papers, user)
+    X1, X2, X3 = prepare_data(papers, user, read=True)
     X_pred = np.c_[X1, X2, X3]
 
     model_file = app.config['ML_FOLDER'] + "/recommendation_model_%d.pickle" % user.id
@@ -85,6 +112,7 @@ def get_tf_idf_ranking(papers, user):
 
 
 def display_features(vectorizer, tfidf_result):
+    # http://stackoverflow.com/questions/16078015/
     scores = zip(vectorizer.get_feature_names(),
                  np.asarray(tfidf_result.sum(axis=0)).ravel())
     sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
@@ -93,9 +121,16 @@ def display_features(vectorizer, tfidf_result):
     return 
 
 
+def moving_average(interval, window_size):
+    if len(interval) > window_size:
+        window = np.ones(int(window_size))/float(window_size)
+        return list(np.convolve(interval, window, 'same'))
+    else:
+        return interval
+
+
 def paper_click_data(user):
-    # Here we retrieve the papers from the elasticsearch database... 
-    # we need the title, abstract and authors to train the model
+    # First we retrieve the papers... we need the title, abstract and authors to train the model
     input_papers = []
     for paper_click in user.paper_click_objects:
         res = []
@@ -140,9 +175,9 @@ def get_negative_arxiv_papers(user, number_of_papers):
                               .limit(number_of_papers).all()
 
 
-def get_model_metrics_through_cross_validation(user):
+def get_auc_through_cross_validation(user):
     ''' 
-    This function calculates different metrics for the recommendation model
+    This function calculates the area under the curve (AUC) for the paper prediction model
     '''
     input_papers = paper_click_data(user)
     negative_papers = get_negative_arxiv_papers(user, len(input_papers))
@@ -154,52 +189,50 @@ def get_model_metrics_through_cross_validation(user):
     X1, X2, X3 = prepare_data(paper_sample, user, write=False)
     X = np.c_[X1, X2, X3]
     
-    results = { 
+    metrics = { 
         'num_cases': len(X),   
         'curves': [],
         'aucs': [],
         'pr': []
     }
-    n_folds = 10
-    kf = KFold(len(X), n_folds, shuffle=True)
+    cross_validation_steps = 10
+    kf = KFold(n_splits=cross_validation_steps, shuffle=True)
     forest = RandomForestClassifier(n_estimators=100)
 
-    for train, test in kf:
+    for train, test in kf.split(X):
         X_train, X_test = X[train], X[test]
         y_train, y_test = y[train], y[test]
 
         forest.fit(X_train, y_train)
-        predictions = forest.predict_proba(X_test)
-        precision, recall, thresholds = precision_recall_curve(y_test, predictions[:,1], pos_label=1)
+        probabilities = forest.predict_proba(X_test)[:,1]
+        precision, recall, thresholds = precision_recall_curve(y_test, probabilities, pos_label=1)
 
         thresholds = np.append(thresholds, np.array([1]))
 
-        # ROC
-        fpr, tpr, thresholds2 = roc_curve(y_test, predictions[:,1], pos_label=1)
-        roc_auc = auc(fpr, tpr)
+        false_positive_rate, true_positive_rate, thresholds2 = roc_curve(y_test, probabilities, pos_label=1)
+        roc_auc = auc(false_positive_rate, true_positive_rate)
         print roc_auc
         if not math.isnan(roc_auc):
-            # PR
-            av_pr = average_precision_score(y_test, predictions[:,1])
+            av_pr = average_precision_score(y_test, probabilities)
 
             case_rate = []
-            for thresh in thresholds:
-                case_rate.append((predictions[:, 1] >= thresh).mean())
+            for threshold in thresholds:
+                case_rate.append(np.mean(probabilities >= threshold))
 
-            this_curve_set = {
+            curves = {
                 'thresholds': thresholds,
                 'precision': precision,
                 'recall': recall,
                 'case_rate': case_rate,
-                'fpr': fpr,
-                'tpr': tpr
+                'fpr': false_positive_rate,
+                'tpr': true_positive_rate
             }
-            results['curves'].append(this_curve_set)
-            results['aucs'].append(roc_auc)
-            results['pr'].append(av_pr)
+            metrics['curves'].append(curves)
+            metrics['aucs'].append(roc_auc)
+            metrics['pr'].append(av_pr)
 
-    plot_cross_validation_result(user, results)
-    return results
+    plot_cross_validation_result(user, metrics)
+    return metrics
 
 
 def stem_tokens(tokens, stemmer):
@@ -222,48 +255,16 @@ def tokenize(text):
 
 
 def pre_precess_text(list_of_texts):
-    ''' This function cleans the abstract and title before feature selection '''
     output_list_of_texts = []
     for text in list_of_texts:
         output_list_of_texts.append(' '.join( tokenize(text) ) )
     return output_list_of_texts
 
 
-def prepare_data_for_prediction(papers, user):
-    '''
-    Here we prepare the feature vector based on a previously calculated model
-    '''
-    list_of_abstracts = [paper.arxiv_abstract for paper in papers]
-    list_of_titles = [paper.arxiv_title for paper in papers]
-    list_of_authors = [paper.arxiv_authors for paper in papers]
-
-    list_of_abstracts = pre_precess_text(list_of_abstracts)
-    list_of_titles = pre_precess_text(list_of_titles)
-
-    abstract_features_file = app.config['ML_FOLDER'] + "/abstract_features_%d.pickle" % user.id
-    vectorizer = pickle.load( open( abstract_features_file, "rb" ) )
-    train_data_features1 = vectorizer.transform(list_of_abstracts)
-
-    title_features_file = app.config['ML_FOLDER'] + "/title_features_%d.pickle" % user.id
-    vectorizer = pickle.load( open( title_features_file, "rb" ) )
-    train_data_features2 = vectorizer.transform(list_of_titles)
- 
-    author_features_file = app.config['ML_FOLDER'] + "/author_features_%d.pickle" % user.id
-    vectorizer = pickle.load( open( author_features_file, "rb" ) )
-    train_data_features3 = vectorizer.transform(list_of_authors)
-
-    # Numpy arrays are easy to work with, so convert the results to arrays
-    train_data_features1 = train_data_features1.toarray()
-    train_data_features2 = train_data_features2.toarray()
-    train_data_features3 = train_data_features3.toarray()
-
-    return train_data_features1, train_data_features2, train_data_features3
-
-
-def prepare_data(papers, user, write=False):
+def prepare_data(papers, user, write=False, read=False):
     ''' 
-    This function turns a list of papers into term frequency-inverse document frequency 
-    (tf-idf) features.
+    This function turns a list of papers into term frequency inverse document frequency 
+    (tfidf) features.
     '''
     # Now we extract the features from these papers (abstract, title and authors)
     list_of_abstracts = [paper.arxiv_abstract for paper in papers]
@@ -274,26 +275,33 @@ def prepare_data(papers, user, write=False):
     list_of_abstracts = pre_precess_text(list_of_abstracts)
     list_of_titles = pre_precess_text(list_of_titles)
     
-    # We calculate the tf-idf for each feature
-    vectorizer = TfidfVectorizer(analyzer="word", tokenizer=None, stop_words="english", max_features=5000) 
-
-    # fit_transform() serves two functions: First, it fits the model
-    # and learns the vocabulary; second, it transforms our training data
-    # into feature vectors. The input to fit_transform should be a list of strings.
-    train_data_features1 = vectorizer.fit_transform(list_of_abstracts)
-    if write:
-        abstract_features_file = app.config['ML_FOLDER'] + "/abstract_features_%d.pickle" % user.id
-        pickle.dump(vectorizer, open( abstract_features_file, "wb" ), protocol=2)
-
-    train_data_features2 = vectorizer.fit_transform(list_of_titles)
-    if write:
-        title_features_file = app.config['ML_FOLDER'] + "/title_features_%d.pickle" % user.id
-        pickle.dump(vectorizer, open( title_features_file, "wb" ), protocol=2)
-
-    train_data_features3 = vectorizer.fit_transform(list_of_authors)
-    if write:
-        author_features_file = app.config['ML_FOLDER'] + "/author_features_%d.pickle" % user.id
-        pickle.dump(vectorizer, open( author_features_file, "wb" ), protocol=2)
+    abstract_features_file = app.config['ML_FOLDER'] + "/abstract_features_%d.pickle" % user.id
+    title_features_file = app.config['ML_FOLDER'] + "/title_features_%d.pickle" % user.id
+    author_features_file = app.config['ML_FOLDER'] + "/author_features_%d.pickle" % user.id
+    
+    # Here we read in the feature lists or create new once if read = False
+    if read:
+        vectorizer = pickle.load( open( abstract_features_file, "rb" ) )
+        train_data_features1 = vectorizer.transform(list_of_abstracts)
+        vectorizer = pickle.load( open( title_features_file, "rb" ) )
+        train_data_features2 = vectorizer.transform(list_of_titles)
+        vectorizer = pickle.load( open( author_features_file, "rb" ) )
+        train_data_features3 = vectorizer.transform(list_of_authors)
+    else:
+        # We calculate the tf-idf for each feature
+        vectorizer = TfidfVectorizer(analyzer="word", tokenizer=None, stop_words="english", max_features=5000) 
+        # fit_transform() serves two functions: First, it fits the model
+        # and learns the vocabulary; second, it transforms our training data
+        # into feature vectors. The input to fit_transform should be a list of strings.
+        train_data_features1 = vectorizer.fit_transform(list_of_abstracts)
+        if write:
+            pickle.dump(vectorizer, open( abstract_features_file, "wb" ), protocol=2)
+        train_data_features2 = vectorizer.fit_transform(list_of_titles)
+        if write:
+            pickle.dump(vectorizer, open( title_features_file, "wb" ), protocol=2)
+        train_data_features3 = vectorizer.fit_transform(list_of_authors)
+        if write:
+            pickle.dump(vectorizer, open( author_features_file, "wb" ), protocol=2)
 
     # Numpy arrays are easy to work with, so convert the results to arrays
     train_data_features1 = train_data_features1.toarray()
@@ -304,8 +312,9 @@ def prepare_data(papers, user, write=False):
 
 
 def calc_model(user):
-    ''' Calculate a new recommendation model '''
+    ''' Calculate a new model (needs to be called within app.app_context())'''
     input_papers = paper_click_data(user)
+    list_of_paper_click_paper_ids = [paper_click.paper_id for paper_click in user.paper_click_objects]
     if input_papers:
         # Now we get the negative paper examples
         if user.user_preference_database == 0:
@@ -319,7 +328,9 @@ def calc_model(user):
         y = np.array(y)
         
         X1, X2, X3 = prepare_data(paper_sample, user, write=True)
-        X_train = np.c_[X1, X2, X3]
+        X = np.c_[X1, X2, X3]
+        X_train = X[:len(paper_sample)]
+        X_pred = X[len(paper_sample):]
 
         forest = RandomForestClassifier(n_estimators=100)
         # forrest now stores the fit information used later for the prediction
@@ -330,7 +341,21 @@ def calc_model(user):
         return forest
     else:
         print "No input papers found... we only get here if there was aproblem with the paper retrieval...", user.id
-        return
+        return False
+
+
+def write_recommendations(user, papers, database_name):
+    # remove all old recommendations
+    while user.paper_recommendations.count():
+        db.session.delete(user.paper_recommendations.first())
+    # write new recommendations
+    for paper in papers:
+        recom = models.Recommendation(user_id = user.id,
+                                      paper_id = paper[0].arxiv_pure_id,
+                                      database_name = database_name,
+                                      score = paper[1])
+        db.session.add(recom)
+    return 
 
 
 def get_most_popular_papers(users):
@@ -351,9 +376,6 @@ def get_most_popular_papers(users):
                                         .group_by(models.Paperclick.paper_id).subquery()
     for user in users: 
         print "process user %d" % user.id
-        # remove all existing recommendations
-        while user.paper_recommendations.count():
-            db.session.delete(user.paper_recommendations.first())
         # For arXiv users
         if user.user_preference_database == 0:
             or_filters = []
@@ -371,27 +393,21 @@ def get_most_popular_papers(users):
                                              .filter(and_(*and_filters))\
                                              .order_by(arxiv_sub_query1.c.click_counts.desc())\
                                              .distinct(arxiv_sub_query1.c.click_counts, models.Papers.arxiv_pure_id)\
-                                             .limit(30)
+                                             .limit(app.config['NUM_RECOMMENDATIONS'])
             papers = papers.add_column(arxiv_sub_query1.c.click_counts).all()
-            # write new paper recommendations
-            for i, paper in enumerate(papers):
-                recom = models.Recommendation(user_id = user.id,
-                                              paper_id = paper[0].arxiv_pure_id,
-                                              database_name = 'arxiv',
-                                              score = paper[1])
-                db.session.add(recom)
+            write_recommendations(user, papers, 'arxiv')
+            db.session.commit()
         # For pubmed users
         elif user.user_preference_database == 1:
             # not implemented yet
             pass
-    db.session.commit()
     return
 
 
 def get_recommendations(users, papers, pubmed_papers=[]):
     ''' 
-    This function uses the recommendation model to produce a list of paper recommendations 
-    for each user.
+    This function uses the available Paperclick data to train a machine learning model and 
+    produce a list of paper recommendations for each user.
     '''
     for user in users:
         print "process user %d" % user.id
@@ -411,26 +427,10 @@ def get_recommendations(users, papers, pubmed_papers=[]):
                     my_set = [paper for paper in pubmed_papers if paper.pm_id not in list_of_paper_ids]
                     database_name = 'pubmed'
                 prob = get_tf_idf_ranking(my_set, user)
-                time1 = time.time()
-                print "ranking finished after %f seconds" % (time1 - time0)
                 paper_prob_pairs = [(x,y) for (y,x) in sorted(zip(prob, my_set), reverse=True)]
-                time2 = time.time()
-                print "ordering finished after %f seconds" % (time2 - time1)
-                # remove all old recommendations
-                while user.paper_recommendations.count():
-                    db.session.delete(user.paper_recommendations.first())
-                time3 = time.time()
-                print "Removed old recons after %f seconds" % (time3 - time2)
-                for paper in paper_prob_pairs[:30]:
-                    recom = models.Recommendation(user_id = user.id,
-                                                  paper_id = paper[0].arxiv_pure_id,
-                                                  database_name = database_name,
-                                                  score = paper[1])
-                    db.session.add(recom)
-                print "Created new recons after %f seconds" % (time.time() - time3)
+                write_recommendations(user, paper_prob_pairs[:app.config['NUM_RECOMMENDATIONS']], 'arxiv')
                 db.session.commit()
                 print "prediction finished after %f seconds" % (time.time() - time0)
-                # we commit for each user just to be sure
             except Exception, e:
                 print "Error: get_recommendations -- in user %d" % user.id
                 print "error message: ", str(e)
